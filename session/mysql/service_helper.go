@@ -1074,13 +1074,15 @@ func (s *Service) getEventRefsWithTimestamp(
 	before *eventRef,
 	limit int,
 ) ([]eventRef, error) {
-	query := fmt.Sprintf(
-		`SELECT id, created_at, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM %s
+	// Sort only id and created_at. JSON_EXTRACT(event) in this statement makes
+	// filesort pack the whole event document, and one oversized row returns
+	// MySQL 1038 even when LIMIT is small. event.timestamp is a filter value,
+	// loaded by primary key after the ordered scan.
+	query := fmt.Sprintf(`SELECT id, created_at FROM %s
 		WHERE app_name = ? AND user_id = ? AND session_id = ?
 		AND created_at >= ?
 		AND deleted_at IS NULL`,
-		s.tableSessionEvents,
-	)
+		s.tableSessionEvents)
 	args := []any{key.AppName, key.UserID, key.SessionID, afterTime}
 	if before != nil {
 		// Composite keyset cursor on (created_at, id); see getPreviousEventRefs
@@ -1094,25 +1096,74 @@ func (s *Service) getEventRefsWithTimestamp(
 	refs := make([]eventRef, 0, limit)
 	err := s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
 		var ref eventRef
-		var eventTimestamp sql.NullString
-		if err := rows.Scan(&ref.id, &ref.createdAt, &eventTimestamp); err != nil {
+		if err := rows.Scan(&ref.id, &ref.createdAt); err != nil {
 			return err
 		}
 		ref.eventTimestamp = ref.createdAt
-		if eventTimestamp.Valid && eventTimestamp.String != "" {
-			parsed, err := time.Parse(time.RFC3339Nano, eventTimestamp.String)
-			if err != nil {
-				return fmt.Errorf("parse event timestamp failed: %w", err)
-			}
-			ref.eventTimestamp = parsed
-		}
 		refs = append(refs, ref)
 		return nil
 	}, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch get events failed: %w", err)
 	}
+	if err := s.fillEventTimestamps(ctx, key, refs); err != nil {
+		return nil, err
+	}
 	return refs, nil
+}
+
+// fillEventTimestamps loads event.timestamp for refs already ordered by
+// (created_at, id). The lookup has no ORDER BY, so a large event JSON is read
+// by primary key and is not packed into the sort buffer.
+func (s *Service) fillEventTimestamps(
+	ctx context.Context,
+	key session.Key,
+	refs []eventRef,
+) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(refs))
+	args := make([]any, len(refs))
+	for i, ref := range refs {
+		placeholders[i] = "?"
+		args[i] = ref.id
+	}
+	// TDSQL PK is (id, user_id); include user_id for shard routing.
+	query := fmt.Sprintf(
+		`SELECT id, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM %s
+		WHERE id IN (%s)
+		AND user_id = ?
+		AND deleted_at IS NULL`,
+		s.tableSessionEvents, strings.Join(placeholders, ","),
+	)
+	args = append(args, key.UserID)
+
+	timestamps := make(map[int64]sql.NullString, len(refs))
+	err := s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
+		var id int64
+		var eventTimestamp sql.NullString
+		if err := rows.Scan(&id, &eventTimestamp); err != nil {
+			return err
+		}
+		timestamps[id] = eventTimestamp
+		return nil
+	}, query, args...)
+	if err != nil {
+		return fmt.Errorf("batch get event timestamps failed: %w", err)
+	}
+	for i := range refs {
+		eventTimestamp, ok := timestamps[refs[i].id]
+		if !ok || !eventTimestamp.Valid || eventTimestamp.String == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, eventTimestamp.String)
+		if err != nil {
+			return fmt.Errorf("parse event timestamp failed: %w", err)
+		}
+		refs[i].eventTimestamp = parsed
+	}
+	return nil
 }
 
 func filterRefsByEventTimestamp(refs []eventRef, afterTime time.Time) []eventRef {

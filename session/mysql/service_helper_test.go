@@ -405,10 +405,11 @@ func TestGetSession_SummaryAwareRestoreFallsBackToCreatedAtWhenEventTimestampMis
 	})
 	legacyBytes := marshalEventWithoutTimestamp(t, legacy)
 	eventCreatedAt := cutoff.Add(time.Minute)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, created_at, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM session_events")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, created_at FROM session_events")).
 		WithArgs(key.AppName, key.UserID, key.SessionID, sessState.CreatedAt, defaultSessionEventLimit).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "event_timestamp"}).
-			AddRow(int64(1), eventCreatedAt, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).
+			AddRow(int64(1), eventCreatedAt))
+	expectEventTimestamps(mock, key, eventRef{id: 1})
 	expectEventsByRefs(
 		mock,
 		key,
